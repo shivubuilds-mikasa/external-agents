@@ -66,10 +66,14 @@ func (a *Agent) ReadSession(input *protocol.HookInputJSON) (protocol.AgentSessio
 	if err != nil {
 		return protocol.AgentSessionJSON{}, fmt.Errorf("read Windsurf transcript: %w", err)
 	}
+	transcript, err := parseWindsurfTranscript(data)
+	if err != nil {
+		return protocol.AgentSessionJSON{}, err
+	}
 	return protocol.AgentSessionJSON{
 		SessionID: id, AgentName: AgentName, RepoPath: protocol.RepoRoot(),
 		SessionRef: input.SessionRef, StartTime: input.Timestamp, NativeData: data,
-		ModifiedFiles: []string{}, NewFiles: []string{}, DeletedFiles: []string{},
+		ModifiedFiles: transcript.modifiedFiles, NewFiles: []string{}, DeletedFiles: []string{},
 	}, nil
 }
 // WriteSession is intentionally a no-op until the lifecycle owner supplies a

@@ -20,6 +20,7 @@ func TestParseHookFixtures(t *testing.T) {
 			event, err := New().ParseHook(test.hook, data); if err != nil { t.Fatal(err) }
 			if test.eventType == 0 { if event != nil { t.Fatalf("code write event = %#v, want nil", event) }; return }
 			if event == nil || event.Type != test.eventType || event.SessionID != "trajectory-123" || event.Metadata["execution_id"] != "execution-456" { t.Fatalf("event = %#v", event) }
+			if test.hook == HookNamePreUserPrompt && event.Prompt != "create a file" { t.Fatalf("prompt = %q", event.Prompt) }
 			if test.hook == HookNamePostCascadeResponseWithTranscript && event.SessionRef != "/home/user/.windsurf/transcripts/trajectory-123.jsonl" { t.Fatalf("session ref = %q", event.SessionRef) }
 			if test.hook == HookNamePostCascadeResponse && event.ResponseMessage != "done" { t.Fatalf("response message = %q", event.ResponseMessage) }
 		})

@@ -58,6 +58,7 @@ func TestReadSessionPassesThroughNativeCascadeTranscript(t *testing.T) {
 	session, err := New().ReadSession(&protocol.HookInputJSON{SessionID: "trajectory-123", SessionRef: path})
 	if err != nil { t.Fatal(err) }
 	if session.SessionID != "trajectory-123" || session.SessionRef != path || len(session.NativeData) == 0 { t.Fatalf("session = %#v", session) }
+	if want := []string{"/path/to/file.py"}; !reflect.DeepEqual(session.ModifiedFiles, want) { t.Fatalf("modified files = %#v, want %#v", session.ModifiedFiles, want) }
 }
 
 func TestNormalizeEvent(t *testing.T) {
