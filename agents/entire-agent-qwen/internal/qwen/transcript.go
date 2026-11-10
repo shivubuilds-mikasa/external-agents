@@ -3,6 +3,7 @@ package qwen
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -211,7 +212,7 @@ func (a *Agent) appendSidecar(raw qwenHookInputRaw) error {
 		StopHookActive:       raw.StopHookActive,
 		Trigger:              raw.Trigger,
 		NotificationType:     raw.NotificationType,
-		Message:              raw.Message,
+		Message:              jsonString(raw.Message),
 		AgentID:              raw.AgentID,
 		AgentType:            raw.AgentType,
 		AgentTranscriptPath:  raw.AgentTranscriptPath,
@@ -227,6 +228,16 @@ func (a *Agent) appendSidecar(raw qwenHookInputRaw) error {
 		LastAssistantMessage: raw.LastAssistantMessage,
 		CustomInstructions:   raw.CustomInstructions,
 		CompactSummary:       raw.CompactSummary,
+	}
+	// Give the line the shape Entire's compact reader needs; see
+	// sidecar_jsonl.go. The projection is derived from the fields above and is
+	// ignored on read, so it never changes what the adapter itself sees.
+	if kind, message := projectSidecarRecord(record, raw.Message); message != nil {
+		if encoded := jsonObject(message); encoded != nil {
+			record.Type = kind
+			record.Timestamp = record.TS
+			record.Message = encoded
+		}
 	}
 	data, err := json.Marshal(record)
 	if err != nil {
@@ -285,11 +296,17 @@ func (a *Agent) writeSessionMarker(raw qwenHookInputRaw, sidecarPath string) err
 	return os.WriteFile(path, append(data, '\n'), 0o600)
 }
 
+// safeFilename reduces an untrusted session ID to one path component. Safe IDs
+// are unchanged unless they name a Windows device; transformed nonblank IDs use a
+// stable hash so they cannot alias an unchanged ID or another normalized form.
+// Sidecar transcripts and marker files must use the same mapping.
 func safeFilename(name string) string {
-	name = strings.TrimSpace(name)
-	if name == "" {
+	// Missing IDs share the same fallback identity as hooks and GetSessionID.
+	if strings.TrimSpace(name) == "" {
 		return stubSessionID
 	}
+	original := name
+	name = strings.TrimSpace(name)
 	var b strings.Builder
 	for _, r := range name {
 		switch {
@@ -311,11 +328,27 @@ func safeFilename(name string) string {
 	}
 	out := strings.Trim(b.String(), "._")
 	if out == "" {
-		return stubSessionID
+		out = stubSessionID
 	}
-	return out
+	if out == original && !isWindowsDeviceName(original) {
+		return out
+	}
+	sum := sha256.Sum256([]byte(original))
+	return fmt.Sprintf("~%x", sum[:16])
 }
 
+// maxSidecarLine bounds a single sidecar record. One record embeds a whole
+// tool_input/tool_response, so 64 KB (bufio.Scanner's default) is far too
+// small: a single large file read or write would make every transcript
+// operation on that session fail with "token too long", permanently, because
+// the oversized record stays on disk. 10 MB matches the limit the other JSONL
+// transcript scanners use.
+const maxSidecarLine = 10 * 1024 * 1024
+
+// readSidecarRecords parses the append-only JSONL sidecar. Unparseable lines
+// retain empty placeholders rather than failing the whole read: the sidecar can be read
+// while Qwen is mid-turn, and a single torn or foreign line must not destroy
+// the rest of the session.
 func readSidecarRecords(path string) ([]sidecarRecord, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -325,14 +358,15 @@ func readSidecarRecords(path string) ([]sidecarRecord, error) {
 
 	var records []sidecarRecord
 	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 64*1024), maxSidecarLine)
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
 		var record sidecarRecord
-		if err := json.Unmarshal([]byte(line), &record); err != nil {
-			return nil, err
+		if json.Unmarshal([]byte(line), &record) != nil {
+			// Keep a placeholder for every physical line: Entire slices the
+			// original bytes by newline, including blank and malformed lines.
+			// Reset partial fields populated before a JSON type error, too.
+			record = sidecarRecord{}
 		}
 		records = append(records, record)
 	}

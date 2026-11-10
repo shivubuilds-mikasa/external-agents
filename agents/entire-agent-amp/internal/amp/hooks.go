@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -95,10 +94,12 @@ func (a *Agent) ParseHook(hookName string, input []byte) (*protocol.EventJSON, e
 	}
 }
 
-// exportThread runs `amp threads export` for the given thread and writes the
-// result to sessionRef. The parent directory is created if needed. Callers
-// generally ignore the returned error and fall back to reporting an empty
-// model so events are still emitted.
+// exportThread runs `amp threads export` for the given thread and stores the
+// result at sessionRef as one-message-per-line JSONL, so Entire's line-based
+// transcript scoping lands on message boundaries (see session_jsonl.go). The
+// native single-JSON export never reaches disk. The parent directory is created
+// if needed. Callers generally ignore the returned error and fall back to
+// reporting an empty model so events are still emitted.
 func (a *Agent) exportThread(threadID, sessionRef string) error {
 	if strings.TrimSpace(threadID) == "" || strings.TrimSpace(sessionRef) == "" {
 		return errors.New("thread id and session ref are required")
@@ -112,8 +113,23 @@ func (a *Agent) exportThread(threadID, sessionRef string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), prepareTranscriptTimeout)
 	defer cancel()
-	_, err := runner.ExportThread(ctx, threadID, sessionRef)
-	return err
+
+	raw, err := runner.ExportThread(ctx, threadID)
+	if err != nil {
+		return err
+	}
+	thread, err := parseAmpExport(raw)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(thread.ID) == "" {
+		thread.ID = strings.TrimSpace(threadID)
+	}
+	encoded, err := materializeThread(thread)
+	if err != nil {
+		return err
+	}
+	return atomicWriteFile(sessionRef, encoded, 0o600)
 }
 
 // latestModelFromSessionRef returns the most recent model string recorded in
@@ -127,11 +143,11 @@ func latestModelFromSessionRef(sessionRef string) string {
 	if err != nil || len(bytes.TrimSpace(data)) == 0 {
 		return ""
 	}
-	thread, err := parseAmpThread(data)
+	messages, err := decodeTranscript(data)
 	if err != nil {
 		return ""
 	}
-	return latestThreadModel(thread)
+	return latestThreadModel(messages)
 }
 
 func (a *Agent) InstallHooks(_ bool, force bool) (int, error) {
@@ -298,13 +314,5 @@ export default function (amp: PluginAPI) {
 }
 
 func transcriptPath(sessionID string) string {
-	return filepath.Join(protocol.DefaultSessionDir(protocol.RepoRoot()), transcriptSubdir, safeSessionID(sessionID)+".jsonl")
-}
-
-func safeSessionID(sessionID string) string {
-	if sessionID == "" {
-		return "unknown"
-	}
-	re := regexp.MustCompile(`[^A-Za-z0-9_.-]+`)
-	return re.ReplaceAllString(sessionID, "_")
+	return filepath.Join(protocol.DefaultSessionDir(protocol.RepoRoot()), transcriptSubdir, safePathSessionID(sessionID)+".jsonl")
 }

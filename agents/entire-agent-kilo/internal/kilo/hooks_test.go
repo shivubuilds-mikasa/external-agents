@@ -2,9 +2,12 @@ package kilo
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -195,6 +198,197 @@ func TestParseHookMissingSessionID(t *testing.T) {
 	}
 }
 
+func TestInstallHooksRefusesForeignPluginWithoutForce(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+
+	// Install the Entire-generated plugin once to establish ownership.
+	if _, err := a.InstallHooks(false, false); err != nil {
+		t.Fatalf("first install error: %v", err)
+	}
+
+	pluginPath := filepath.Join(repo, pluginFile)
+	if err := os.WriteFile(pluginPath, []byte("// user's custom kilo plugin\nexport default {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Default install must refuse to overwrite the foreign plugin.
+	count, err := a.InstallHooks(false, false)
+	if err == nil || count != 0 {
+		t.Fatalf("foreign install count=%d err=%v, want error", count, err)
+	}
+	foreign, readErr := os.ReadFile(pluginPath)
+	if readErr != nil || !strings.Contains(string(foreign), "user's custom kilo plugin") {
+		t.Fatalf("foreign plugin was changed: %q err=%v", foreign, readErr)
+	}
+
+	// Explicit force install may replace the foreign plugin.
+	count, err = a.InstallHooks(false, true)
+	if err != nil || count != 1 {
+		t.Fatalf("forced install count=%d err=%v, want success", count, err)
+	}
+	if !a.AreHooksInstalled() {
+		t.Fatal("generated plugin should be installed after forced replacement")
+	}
+}
+
+func TestUninstallHooksLeavesForeignPluginUntouched(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+
+	pluginPath := filepath.Join(repo, pluginFile)
+	if err := os.MkdirAll(filepath.Dir(pluginPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pluginPath, []byte("// user's custom kilo plugin\nexport default {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.UninstallHooks(); err != nil {
+		t.Fatalf("uninstall error: %v", err)
+	}
+	data, readErr := os.ReadFile(pluginPath)
+	if readErr != nil || string(data) != "// user's custom kilo plugin\nexport default {}\n" {
+		t.Fatalf("uninstall changed foreign plugin: %q err=%v", data, readErr)
+	}
+}
+
+func TestAreHooksInstalledRequiresOwnershipMarker(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+
+	pluginPath := filepath.Join(repo, pluginFile)
+	if err := os.MkdirAll(filepath.Dir(pluginPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(pluginPath, []byte("// user's custom kilo plugin\nexport default {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if a.AreHooksInstalled() {
+		t.Fatal("foreign plugin reported as installed")
+	}
+	if err := a.UninstallHooks(); err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := os.ReadFile(pluginPath)
+	if readErr != nil || !strings.Contains(string(data), "user's custom kilo plugin") {
+		t.Fatalf("uninstall changed foreign plugin: %q err=%v", data, readErr)
+	}
+}
+
+func TestInstallHooksRefusesSymlinkWithoutForce(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+
+	pluginPath := filepath.Join(repo, pluginFile)
+	outside := filepath.Join(t.TempDir(), "outside.ts")
+	if err := os.MkdirAll(filepath.Dir(pluginPath), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, pluginPath); err != nil {
+		// ERROR_PRIVILEGE_NOT_HELD is Windows error 1314.
+		const privilegeNotHeld = syscall.Errno(1314)
+		if runtime.GOOS == "windows" && (os.IsPermission(err) || errors.Is(err, privilegeNotHeld)) {
+			t.Skipf("symlink creation requires Windows privileges: %v", err)
+		}
+		t.Fatal(err)
+	}
+
+	if _, err := a.InstallHooks(false, false); err == nil {
+		t.Fatal("install should reject a plugin symlink without force")
+	}
+	if _, err := os.Lstat(pluginPath); err != nil {
+		t.Fatalf("plugin symlink was unexpectedly removed: %v", err)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("install wrote through symlink to %s", outside)
+	}
+
+	count, err := a.InstallHooks(false, true)
+	if err != nil || count != 1 {
+		t.Fatalf("forced install count=%d err=%v, want 1 and success", count, err)
+	}
+	info, err := os.Lstat(pluginPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		t.Fatal("forced install left the plugin as a symlink")
+	}
+}
+
+func TestInstallHooksForceRepairsPermissionsForIdenticalContent(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not implement POSIX file permission bits")
+	}
+
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+
+	if _, err := a.InstallHooks(false, false); err != nil {
+		t.Fatal(err)
+	}
+	pluginPath := filepath.Join(repo, pluginFile)
+	if err := os.Chmod(pluginPath, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	count, err := a.InstallHooks(false, true)
+	if err != nil || count != 1 {
+		t.Fatalf("forced identical install count=%d err=%v, want 1 and success", count, err)
+	}
+	info, err := os.Stat(pluginPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("forced install permissions = %o, want 600", got)
+	}
+}
+
+func TestUninstallHooksRemovesEmptyPluginDirectories(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+	if _, err := a.InstallHooks(false, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.UninstallHooks(); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{filepath.Join(repo, pluginDir), filepath.Join(repo, ".kilo")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("directory %s still exists, err=%v", path, err)
+		}
+	}
+}
+
+func TestAreHooksInstalledAllowsUninstallInKiloPure(t *testing.T) {
+	repo := t.TempDir()
+	t.Setenv("ENTIRE_REPO_ROOT", repo)
+	a := New()
+	if _, err := a.InstallHooks(false, false); err != nil {
+		t.Fatal(err)
+	}
+	if !a.AreHooksInstalled() {
+		t.Fatal("hooks should be installed outside pure mode")
+	}
+	t.Setenv("KILO_PURE", "1")
+	// Entire only uninstalls adapters that report installed hooks.
+	if a.AreHooksInstalled() {
+		if err := a.UninstallHooks(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.Lstat(filepath.Join(repo, pluginFile)); !os.IsNotExist(err) {
+		t.Fatalf("owned plugin remains after uninstall in pure mode: %v", err)
+	}
+}
+
 func TestInstallAndUninstallHooks(t *testing.T) {
 	repo := t.TempDir()
 	t.Setenv("ENTIRE_REPO_ROOT", repo)
@@ -259,6 +453,11 @@ func TestInstallAndUninstallHooks(t *testing.T) {
 	if a.AreHooksInstalled() {
 		t.Fatal("hooks should not be installed after uninstall")
 	}
+	for _, path := range []string{filepath.Join(repo, pluginDir), filepath.Join(repo, ".kilo")} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("directory %s still exists after uninstall, err=%v", path, err)
+		}
+	}
 }
 
 func TestGeneratedPluginStartsTurnFromTextPart(t *testing.T) {
@@ -284,15 +483,96 @@ func TestGeneratedPluginTurnEndIsSynchronous(t *testing.T) {
 
 func TestSafeSessionID(t *testing.T) {
 	cases := map[string]string{
-		"":                  "unknown",
+		"":                  "~e3b0c44298fc1c149afbf4c8996fb924",
 		"S-abc_123":         "S-abc_123",
-		"path/with/slashes": "path_with_slashes",
-		"weird chars!@#$%":  "weird_chars_",
+		"path/with/slashes": "~0f5bd24a68a0f5fafb48b6af79fac130",
+		"weird chars!@#$%":  "~cbedb3d0deb4371167f7c3f15dd5c053",
 		"dotted.id.is.fine": "dotted.id.is.fine",
 	}
 	for in, want := range cases {
 		if got := safeSessionID(in); got != want {
 			t.Errorf("safeSessionID(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestInstallHooksRejectsDirectoryEvenWithForce(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		name := "without force"
+		if force {
+			name = "with force"
+		}
+		t.Run(name, func(t *testing.T) {
+			repo := t.TempDir()
+			t.Setenv("ENTIRE_REPO_ROOT", repo)
+			path := filepath.Join(repo, pluginFile)
+			if err := os.MkdirAll(path, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			child := filepath.Join(path, "keep.txt")
+			if err := os.WriteFile(child, []byte("user data"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			count, err := New().InstallHooks(false, force)
+			if err == nil || count != 0 || !strings.Contains(err.Error(), "move or remove the directory") {
+				t.Fatalf("count=%d err=%v, want explicit directory guidance", count, err)
+			}
+			data, err := os.ReadFile(child)
+			if err != nil || string(data) != "user data" {
+				t.Fatalf("directory contents changed: %q, %v", data, err)
+			}
+		})
+	}
+}
+
+func TestUninstallHooksHandlesPluginSymlinks(t *testing.T) {
+	for _, kind := range []string{"owned", "foreign", "dangling"} {
+		t.Run(kind, func(t *testing.T) {
+			repo := t.TempDir()
+			t.Setenv("ENTIRE_REPO_ROOT", repo)
+			a := New()
+			path := filepath.Join(repo, pluginFile)
+			if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(t.TempDir(), "plugin.ts")
+			content := "// user plugin"
+			if kind == "owned" {
+				content = generatePlugin()
+			}
+			if kind != "dangling" {
+				if err := os.WriteFile(target, []byte(content), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+			if got := a.AreHooksInstalled(); got != (kind == "owned") {
+				t.Fatalf("installed = %t for %s", got, kind)
+			}
+			if err := a.UninstallHooks(); err != nil {
+				t.Fatal(err)
+			}
+			_, err := os.Lstat(path)
+			if kind == "owned" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("owned link remains: %v", err)
+				}
+				if a.AreHooksInstalled() {
+					t.Fatal("hooks still installed")
+				}
+			} else if err != nil {
+				t.Fatalf("foreign or dangling link removed: %v", err)
+			}
+			data, err := os.ReadFile(target)
+			if kind == "dangling" {
+				if !os.IsNotExist(err) {
+					t.Fatalf("dangling target changed: %v", err)
+				}
+			} else if err != nil || string(data) != content {
+				t.Fatalf("target modified: %v", err)
+			}
+		})
 	}
 }
